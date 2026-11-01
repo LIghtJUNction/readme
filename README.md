@@ -12,7 +12,7 @@ This is `readme` reading **this very README**. The screenshot was captured from 
 
 ![The readme terminal viewer displaying its own README](assets/readme-viewer.png)
 
-Local and HTTP(S) images are rendered in color using terminal character cells. PNG, JPEG, GIF, WebP, BMP and SVG are supported; animated images show their first frame. True-color terminal support gives the best results. The interactive viewer enables color even when `NO_COLOR` is set because images rely on it; `--static` remains plain text.
+Local and HTTP(S) images use native graphics in Kitty, Ghostty, WezTerm, iTerm2 and Sixel-capable terminals such as foot. Other terminals use colored character cells as a fallback. The protocol is detected automatically; override it with `--image-protocol kitty`, `iterm2`, `sixel`, or `blocks`. PNG, JPEG, GIF, WebP, BMP and SVG are supported; animated images show their first frame. True-color terminal support gives the best results. The interactive viewer enables color even when `NO_COLOR` is set because images rely on it; `--static` remains plain text.
 
 ## Installation
 

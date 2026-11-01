@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use clap::{Parser as CliParser, Subcommand};
+use clap::{Parser as CliParser, Subcommand, ValueEnum};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event as Input, KeyCode, KeyEventKind,
@@ -17,9 +17,14 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
 };
+use ratatui_image::{
+    Resize,
+    picker::{Picker, ProtocolType},
+    sliced::{SlicedImage, SlicedProtocol},
+};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
@@ -47,8 +52,69 @@ struct Cli {
     /// Show literal Markdown; with --html escape it inside a preformatted page
     #[arg(long)]
     raw: bool,
+    /// Image protocol: auto, kitty, iterm2, sixel or blocks
+    #[arg(long, value_enum, default_value_t = ImageProtocol::Auto)]
+    image_protocol: ImageProtocol,
     #[command(subcommand)]
     command: Option<Commands>,
+}
+#[derive(Clone, Copy, ValueEnum)]
+enum ImageProtocol {
+    Auto,
+    Kitty,
+    Iterm2,
+    Sixel,
+    Blocks,
+}
+fn picker_for(choice: ImageProtocol, has_images: bool) -> Picker {
+    let term = std::env::var("TERM")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let program = std::env::var("TERM_PROGRAM")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let explicit = match choice {
+        ImageProtocol::Kitty => Some(ProtocolType::Kitty),
+        ImageProtocol::Iterm2 => Some(ProtocolType::Iterm2),
+        ImageProtocol::Sixel => Some(ProtocolType::Sixel),
+        ImageProtocol::Blocks => Some(ProtocolType::Halfblocks),
+        ImageProtocol::Auto
+            if std::env::var_os("WEZTERM_EXECUTABLE").is_some()
+                || program == "wezterm"
+                || program.contains("iterm") =>
+        {
+            Some(ProtocolType::Iterm2)
+        }
+        ImageProtocol::Auto
+            if term.contains("kitty")
+                || term.contains("ghostty")
+                || program.contains("ghostty")
+                || std::env::var_os("KITTY_WINDOW_ID").is_some() =>
+        {
+            Some(ProtocolType::Kitty)
+        }
+        ImageProtocol::Auto if term.starts_with("foot") => Some(ProtocolType::Sixel),
+        ImageProtocol::Auto => None,
+    };
+    if let Some(protocol) = explicit {
+        let w = crossterm::terminal::window_size().ok();
+        let cw = w
+            .as_ref()
+            .filter(|s| s.width > 0 && s.columns > 0)
+            .map_or(10, |s| (s.width / s.columns).max(1));
+        let ch = w
+            .as_ref()
+            .filter(|s| s.height > 0 && s.rows > 0)
+            .map_or(20, |s| (s.height / s.rows).max(1));
+        #[allow(deprecated)]
+        let mut picker = Picker::from_fontsize(ratatui_image::FontSize::new(cw, ch));
+        picker.set_protocol_type(protocol);
+        picker
+    } else if has_images {
+        Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks())
+    } else {
+        Picker::halfblocks()
+    }
 }
 #[derive(Subcommand)]
 enum Commands {
@@ -85,6 +151,12 @@ struct Row {
     style: Style,
     image: Option<Arc<image::RgbaImage>>,
     pixels: Option<Vec<(Color, Color)>>,
+    native: Option<NativeRow>,
+}
+#[derive(Clone)]
+struct NativeRow {
+    id: usize,
+    offset: u32,
 }
 
 fn root() -> Result<PathBuf> {
@@ -419,6 +491,64 @@ fn wrap_rows(rows: &[Row], width: usize) -> Vec<Row> {
     }
     result
 }
+fn native_wrap(rows: &[Row], width: usize, protocols: &HashMap<usize, SlicedProtocol>) -> Vec<Row> {
+    let mut result = Vec::new();
+    for row in rows {
+        if let Some(img) = &row.image {
+            let id = Arc::as_ptr(img) as usize;
+            if let Some(protocol) = protocols.get(&id) {
+                let size = protocol.size();
+                for offset in 0..size.height {
+                    result.push(Row {
+                        text: String::new(),
+                        image: None,
+                        pixels: None,
+                        native: Some(NativeRow {
+                            id,
+                            offset: offset as u32,
+                        }),
+                        ..row.clone()
+                    });
+                }
+            } else {
+                result.extend(wrap_rows(std::slice::from_ref(row), width));
+            }
+        } else {
+            result.extend(wrap_rows(std::slice::from_ref(row), width));
+        }
+    }
+    result
+}
+fn image_protocols(rows: &[Row], width: u16, picker: &Picker) -> HashMap<usize, SlicedProtocol> {
+    let mut protocols = HashMap::new();
+    for row in rows {
+        if let Some(img) = &row.image {
+            let id = Arc::as_ptr(img) as usize;
+            if protocols.contains_key(&id) {
+                continue;
+            }
+            let size = picker.font_size();
+            let cols = (img.width() as f64 / size.width.max(1) as f64)
+                .ceil()
+                .clamp(1.0, width.max(1) as f64) as u16;
+            let h = (img.height() as f64 * cols as f64 * size.width as f64
+                / img.width().max(1) as f64
+                / size.height.max(1) as f64)
+                .ceil()
+                .clamp(1.0, 200.0) as u16;
+            let image = image::DynamicImage::ImageRgba8((**img).clone());
+            if let Ok(protocol) = SlicedProtocol::new_with_resize(
+                picker,
+                image,
+                ratatui::layout::Size::new(cols, h),
+                Resize::Fit(None),
+            ) {
+                protocols.insert(id, protocol);
+            }
+        }
+    }
+    protocols
+}
 fn render(md: &str, cfg: &Config, base: &Path, images: bool) -> (Vec<Row>, Vec<Heading>) {
     let mut rows = Vec::new();
     let mut headings = Vec::new();
@@ -445,6 +575,7 @@ fn render(md: &str, cfg: &Config, base: &Path, images: bool) -> (Vec<Row>, Vec<H
             style: row_style,
             image: None,
             pixels: None,
+            native: None,
         });
     };
     let prepared = terminal_markdown(md);
@@ -485,6 +616,7 @@ fn render(md: &str, cfg: &Config, base: &Path, images: bool) -> (Vec<Row>, Vec<H
                         style: Style::default().fg(Color::DarkGray),
                         image: None,
                         pixels: None,
+                        native: None,
                     };
                     if images {
                         match load_image(&source, base) {
@@ -594,7 +726,7 @@ fn visible(rows: &[Row], headings: &[Heading], folded: &HashSet<usize>) -> Vec<R
     }
     out
 }
-fn tui(rows: Vec<Row>, headings: Vec<Heading>) -> Result<()> {
+fn tui(rows: Vec<Row>, headings: Vec<Heading>, choice: ImageProtocol) -> Result<()> {
     if !io::stdout().is_terminal() || !io::stdin().is_terminal() {
         bail!("Interactive mode requires a terminal; use --static for redirected output")
     }
@@ -607,17 +739,35 @@ fn tui(rows: Vec<Row>, headings: Vec<Heading>) -> Result<()> {
         return Err(e.into());
     }
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+    let picker = picker_for(choice, rows.iter().any(|r| r.image.is_some()));
     let result = (|| -> Result<()> {
         let mut folded = HashSet::new();
         let mut scroll = 0usize;
         let mut selected = 0usize;
         let mut outline = false;
+        let mut protocols: HashMap<usize, SlicedProtocol> = HashMap::new();
+        let mut protocol_width = 0;
+        let mut cached: Vec<Row> = Vec::new();
+        let mut cached_width = 0;
+        let mut cached_folded = HashSet::new();
         loop {
             let size = terminal.size()?;
-            let shown = wrap_rows(
-                &visible(&rows, &headings, &folded),
-                size.width.saturating_sub(2) as usize,
-            );
+            let width = size.width.saturating_sub(2) as usize;
+            if protocol_width != width {
+                protocols = image_protocols(&rows, width as u16, &picker);
+                protocol_width = width;
+            }
+            if cached_width != width || cached_folded != folded || cached.is_empty() {
+                cached = native_wrap(&visible(&rows, &headings, &folded), width, &protocols);
+                cached_width = width;
+                cached_folded = folded.clone();
+            }
+            if !cached.is_empty() {
+                scroll = scroll.min(cached.len() - 1);
+            } else {
+                scroll = 0;
+            }
+            let shown = &cached;
             terminal.draw(|f| {
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
@@ -676,6 +826,26 @@ fn tui(rows: Vec<Row>, headings: Vec<Heading>) -> Result<()> {
                         .scroll((offset.min(u16::MAX as usize) as u16, 0)),
                     chunks[0],
                 );
+                if !outline {
+                    let inner = ratatui::layout::Rect::new(
+                        chunks[0].x + 1,
+                        chunks[0].y + 1,
+                        chunks[0].width.saturating_sub(2),
+                        chunks[0].height.saturating_sub(2),
+                    );
+                    for (index, row) in shown.iter().enumerate() {
+                        if let Some(native) = &row.native
+                            && native.offset == 0
+                        {
+                            let y = (index as i64 - scroll as i64)
+                                .clamp(i16::MIN as i64, i16::MAX as i64)
+                                as i16;
+                            if let Some(protocol) = protocols.get(&native.id) {
+                                f.render_widget(SlicedImage::new(protocol, (0, y).into()), inner);
+                            }
+                        }
+                    }
+                }
                 f.render_widget(
                     Paragraph::new(
                         "↑↓/jk scroll  n/p heading  click/Enter fold  o outline  q quit",
@@ -771,9 +941,10 @@ fn tui(rows: Vec<Row>, headings: Vec<Heading>) -> Result<()> {
                             if outline {
                                 if !headings.is_empty() {
                                     folded.clear();
-                                    let all = wrap_rows(
+                                    let all = native_wrap(
                                         &visible(&rows, &headings, &folded),
                                         size.width.saturating_sub(2) as usize,
+                                        &protocols,
                                     );
                                     scroll = all
                                         .iter()
@@ -851,7 +1022,7 @@ fn run() -> Result<()> {
             println!("{}", row.text)
         }
     } else {
-        tui(rows, headings)?
+        tui(rows, headings, cli.image_protocol)?
     }
     Ok(())
 }
@@ -932,6 +1103,7 @@ mod tests {
             style: Style::default(),
             image: None,
             pixels: None,
+            native: None,
         };
         let wrapped = wrap_rows(&[row], 5);
         assert!(wrapped.len() > 1);
