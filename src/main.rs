@@ -1,7 +1,10 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser as CliParser, Subcommand};
 use crossterm::{
-    event::{self, Event as Input, KeyCode, KeyEventKind},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event as Input, KeyCode, KeyEventKind,
+        MouseButton, MouseEventKind,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -12,7 +15,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Paragraph},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -22,6 +25,7 @@ use std::{
     path::PathBuf,
     process::{Command, Stdio},
 };
+use unicode_width::UnicodeWidthChar;
 
 #[derive(CliParser)]
 #[command(version, about = "Read and convert the current directory's README")]
@@ -252,6 +256,53 @@ fn color(s: Option<&str>, fallback: Color) -> Color {
         _ => fallback,
     }
 }
+// Markdown inside HTML containers is often emitted as an HTML block. Strip the
+// tags only from HTML events, then parse the resulting Markdown again.
+fn terminal_markdown(md: &str) -> String {
+    let tags = regex::Regex::new(r"(?s)<!--.*?-->|</?[A-Za-z][^>]*>").unwrap();
+    let img = regex::Regex::new(r#"(?is)<img\b[^>]*\balt\s*=\s*["']([^"']*)["'][^>]*>"#).unwrap();
+    let mut result = String::new();
+    let mut offset = 0;
+    for (event, range) in Parser::new_ext(md, options()).into_offset_iter() {
+        if matches!(event, Event::Html(_) | Event::InlineHtml(_)) {
+            if range.start < offset {
+                continue;
+            }
+            result.push_str(&md[offset..range.start]);
+            let fragment = &md[range.clone()];
+            let fragment = img.replace_all(fragment, "[image: $1]");
+            result.push_str(&tags.replace_all(&fragment, ""));
+            offset = range.end;
+        }
+    }
+    result.push_str(&md[offset..]);
+    result
+}
+fn wrap_rows(rows: &[Row], width: usize) -> Vec<Row> {
+    let width = width.max(1);
+    let mut result = Vec::new();
+    for row in rows {
+        let mut text = String::new();
+        let mut used = 0;
+        for ch in row.text.chars() {
+            let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if used + w > width && !text.is_empty() {
+                result.push(Row {
+                    text: std::mem::take(&mut text),
+                    ..row.clone()
+                });
+                used = 0;
+            }
+            text.push(ch);
+            used += w;
+        }
+        result.push(Row {
+            text,
+            ..row.clone()
+        });
+    }
+    result
+}
 fn render(md: &str, cfg: &Config) -> (Vec<Row>, Vec<Heading>) {
     let mut rows = Vec::new();
     let mut headings = Vec::new();
@@ -270,10 +321,14 @@ fn render(md: &str, cfg: &Config) -> (Vec<Row>, Vec<Heading>) {
             style: if current.is_some() { title } else { normal },
         });
     };
-    for event in Parser::new_ext(md, options()) {
+    let prepared = terminal_markdown(md);
+    for event in Parser::new_ext(&prepared, options()) {
         match event {
             Event::Start(Tag::Heading { level: l, .. }) => {
                 if !line.is_empty() {
+                    flush(&mut rows, &mut line, None);
+                }
+                if !rows.is_empty() && rows.last().is_some_and(|r: &Row| !r.text.is_empty()) {
                     flush(&mut rows, &mut line, None);
                 }
                 current = Some(headings.len());
@@ -289,6 +344,8 @@ fn render(md: &str, cfg: &Config) -> (Vec<Row>, Vec<Heading>) {
                 flush(&mut rows, &mut line, current);
                 current = None;
             }
+            Event::Start(Tag::Image { .. }) => line.push_str("[image: "),
+            Event::End(TagEnd::Image) => line.push(']'),
             Event::Start(Tag::CodeBlock(_)) => {
                 code = true;
             }
@@ -326,9 +383,12 @@ fn render(md: &str, cfg: &Config) -> (Vec<Row>, Vec<Heading>) {
                 flush(&mut rows, &mut line, None);
             }
             Event::TaskListMarker(done) => line.push_str(if done { "[x] " } else { "[ ] " }),
-            Event::End(TagEnd::Paragraph | TagEnd::Item | TagEnd::TableRow) => {
+            Event::End(TagEnd::Paragraph | TagEnd::Item | TagEnd::TableRow | TagEnd::TableHead) => {
                 if !line.is_empty() {
                     flush(&mut rows, &mut line, current);
+                }
+                if matches!(event, Event::End(TagEnd::Paragraph)) && list == 0 {
+                    flush(&mut rows, &mut line, None);
                 }
             }
             Event::End(TagEnd::TableCell) => line.push_str("  │  "),
@@ -387,7 +447,7 @@ fn tui(rows: Vec<Row>, headings: Vec<Heading>) -> Result<()> {
     }
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    if let Err(e) = execute!(stdout, EnterAlternateScreen) {
+    if let Err(e) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
         let _ = disable_raw_mode();
         return Err(e.into());
     }
@@ -398,7 +458,11 @@ fn tui(rows: Vec<Row>, headings: Vec<Heading>) -> Result<()> {
         let mut selected = 0usize;
         let mut outline = false;
         loop {
-            let shown = visible(&rows, &headings, &folded);
+            let size = terminal.size()?;
+            let shown = wrap_rows(
+                &visible(&rows, &headings, &folded),
+                size.width.saturating_sub(2) as usize,
+            );
             terminal.draw(|f| {
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
@@ -444,69 +508,134 @@ fn tui(rows: Vec<Row>, headings: Vec<Heading>) -> Result<()> {
                         } else {
                             "README"
                         }))
-                        .wrap(Wrap { trim: false })
                         .scroll((offset.min(u16::MAX as usize) as u16, 0)),
                     chunks[0],
                 );
                 f.render_widget(
-                    Paragraph::new("↑↓/jk scroll  o outline  Enter fold/jump  q quit"),
+                    Paragraph::new(
+                        "↑↓/jk scroll  n/p heading  click/Enter fold  o outline  q quit",
+                    ),
                     chunks[1],
                 );
             })?;
-            if let Input::Key(k) = event::read()? {
-                if k.kind == KeyEventKind::Release {
-                    continue;
-                }
-                match k.code {
-                    KeyCode::Char('q') | KeyCode::Esc => {
-                        if outline {
-                            outline = false
-                        } else {
-                            break;
-                        }
-                    }
-                    KeyCode::Char('o') => outline = !outline,
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        if outline {
-                            selected = (selected + 1).min(headings.len().saturating_sub(1))
-                        } else {
-                            scroll = (scroll + 1).min(shown.len().saturating_sub(1))
-                        }
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        if outline {
-                            selected = selected.saturating_sub(1)
-                        } else {
-                            scroll = scroll.saturating_sub(1)
-                        }
-                    }
-                    KeyCode::PageDown => scroll = (scroll + 10).min(shown.len().saturating_sub(1)),
-                    KeyCode::PageUp => scroll = scroll.saturating_sub(10),
-                    KeyCode::Enter | KeyCode::Char(' ') => {
-                        if outline {
-                            if !headings.is_empty() {
-                                folded.clear();
-                                let all = visible(&rows, &headings, &folded);
-                                scroll = all
-                                    .iter()
-                                    .position(|r| r.heading == Some(selected))
-                                    .unwrap_or(0);
-                                outline = false;
-                            }
-                        } else if let Some(i) = shown.get(scroll).and_then(|r| r.heading)
-                            && !folded.insert(i)
+            match event::read()? {
+                Input::Mouse(mouse) if !outline => match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left)
+                        if mouse.column > 0
+                            && mouse.column < size.width.saturating_sub(1)
+                            && mouse.row > 0
+                            && mouse.row < size.height.saturating_sub(2) =>
+                    {
+                        if let Some(i) = shown
+                            .get(scroll + mouse.row as usize - 1)
+                            .and_then(|r| r.heading)
                         {
-                            folded.remove(&i);
+                            if !folded.insert(i) {
+                                folded.remove(&i);
+                            }
+                            scroll = scroll.min(shown.len().saturating_sub(1));
                         }
                     }
+                    MouseEventKind::ScrollDown => {
+                        scroll = (scroll + 3).min(shown.len().saturating_sub(1))
+                    }
+                    MouseEventKind::ScrollUp => scroll = scroll.saturating_sub(3),
                     _ => {}
+                },
+                Input::Key(k) => {
+                    if k.kind == KeyEventKind::Release {
+                        continue;
+                    }
+                    match k.code {
+                        KeyCode::Char('q') | KeyCode::Esc => {
+                            if outline {
+                                outline = false
+                            } else {
+                                break;
+                            }
+                        }
+                        KeyCode::Char('o') => outline = !outline,
+                        KeyCode::Char('n') if !outline => {
+                            if let Some(pos) = shown
+                                .iter()
+                                .enumerate()
+                                .skip(scroll + 1)
+                                .find(|(i, r)| {
+                                    r.heading.is_some()
+                                        && (*i == 0 || shown[*i - 1].heading != r.heading)
+                                })
+                                .map(|(i, _)| i)
+                            {
+                                scroll = pos;
+                            }
+                        }
+                        KeyCode::Char('p') if !outline => {
+                            if let Some(pos) = shown
+                                .iter()
+                                .enumerate()
+                                .take(scroll)
+                                .rev()
+                                .find(|(i, r)| {
+                                    r.heading.is_some()
+                                        && (*i == 0 || shown[*i - 1].heading != r.heading)
+                                })
+                                .map(|(i, _)| i)
+                            {
+                                scroll = pos;
+                            }
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            if outline {
+                                selected = (selected + 1).min(headings.len().saturating_sub(1))
+                            } else {
+                                scroll = (scroll + 1).min(shown.len().saturating_sub(1))
+                            }
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            if outline {
+                                selected = selected.saturating_sub(1)
+                            } else {
+                                scroll = scroll.saturating_sub(1)
+                            }
+                        }
+                        KeyCode::PageDown => {
+                            scroll = (scroll + 10).min(shown.len().saturating_sub(1))
+                        }
+                        KeyCode::PageUp => scroll = scroll.saturating_sub(10),
+                        KeyCode::Enter | KeyCode::Char(' ') => {
+                            if outline {
+                                if !headings.is_empty() {
+                                    folded.clear();
+                                    let all = wrap_rows(
+                                        &visible(&rows, &headings, &folded),
+                                        size.width.saturating_sub(2) as usize,
+                                    );
+                                    scroll = all
+                                        .iter()
+                                        .position(|r| r.heading == Some(selected))
+                                        .unwrap_or(0);
+                                    outline = false;
+                                }
+                            } else if let Some(i) = shown.get(scroll).and_then(|r| r.heading)
+                                && !folded.insert(i)
+                            {
+                                folded.remove(&i);
+                            }
+                        }
+                        _ => {}
+                    }
                 }
+                _ => {}
             }
         }
         Ok(())
     })();
     let raw = disable_raw_mode();
-    let leave = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let leave = execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    );
     let _ = terminal.show_cursor();
     result?;
     raw?;
@@ -564,6 +693,34 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn html_containers_do_not_hide_markdown_or_leak_tags() {
+        let (rows, headings) = render(
+            "<div align=\"center\">\n\n# Hello\n\nSome **text**.\n\n</div>\n",
+            &Config::default(),
+        );
+        assert_eq!(headings[0].text, "Hello");
+        let text = rows
+            .iter()
+            .map(|r| r.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Some text."));
+        assert!(!text.contains("<div"));
+        let (rows, _) = render("```html\n<div>\n```", &Config::default());
+        assert!(rows.iter().any(|r| r.text.contains("<div>")));
+    }
+    #[test]
+    fn wrapped_rows_keep_heading_mapping() {
+        let row = Row {
+            text: "▾ 中文 heading".into(),
+            heading: Some(0),
+            style: Style::default(),
+        };
+        let wrapped = wrap_rows(&[row], 5);
+        assert!(wrapped.len() > 1);
+        assert!(wrapped.iter().all(|r| r.heading == Some(0)));
+    }
     #[test]
     fn folding_hides_nested_content_but_not_siblings() {
         let (rows, headings) = render(
