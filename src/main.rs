@@ -21,9 +21,11 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
     fs,
-    io::{self, IsTerminal, Write},
-    path::PathBuf,
+    io::{self, IsTerminal, Read, Write},
+    path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::Arc,
+    time::Duration,
 };
 use unicode_width::UnicodeWidthChar;
 
@@ -81,6 +83,8 @@ struct Row {
     text: String,
     heading: Option<usize>,
     style: Style,
+    image: Option<Arc<image::RgbaImage>>,
+    pixels: Option<Vec<(Color, Color)>>,
 }
 
 fn root() -> Result<PathBuf> {
@@ -260,7 +264,9 @@ fn color(s: Option<&str>, fallback: Color) -> Color {
 // tags only from HTML events, then parse the resulting Markdown again.
 fn terminal_markdown(md: &str) -> String {
     let tags = regex::Regex::new(r"(?s)<!--.*?-->|</?[A-Za-z][^>]*>").unwrap();
-    let img = regex::Regex::new(r#"(?is)<img\b[^>]*\balt\s*=\s*["']([^"']*)["'][^>]*>"#).unwrap();
+    let img = regex::Regex::new(r"(?is)<img\b[^>]*>").unwrap();
+    let src = regex::Regex::new(r#"(?i)\bsrc\s*=\s*["']([^"']+)["']"#).unwrap();
+    let alt = regex::Regex::new(r#"(?i)\balt\s*=\s*["']([^"']*)["']"#).unwrap();
     let mut result = String::new();
     let mut offset = 0;
     for (event, range) in Parser::new_ext(md, options()).into_offset_iter() {
@@ -270,7 +276,18 @@ fn terminal_markdown(md: &str) -> String {
             }
             result.push_str(&md[offset..range.start]);
             let fragment = &md[range.clone()];
-            let fragment = img.replace_all(fragment, "[image: $1]");
+            let fragment = img.replace_all(fragment, |caps: &regex::Captures| {
+                let tag = &caps[0];
+                match src.captures(tag) {
+                    Some(source) => format!(
+                        "![{}]({})",
+                        alt.captures(tag)
+                            .map_or("image", |a| a.get(1).unwrap().as_str()),
+                        source.get(1).unwrap().as_str().replace("&amp;", "&")
+                    ),
+                    None => String::new(),
+                }
+            });
             result.push_str(&tags.replace_all(&fragment, ""));
             offset = range.end;
         }
@@ -278,10 +295,109 @@ fn terminal_markdown(md: &str) -> String {
     result.push_str(&md[offset..]);
     result
 }
+const IMAGE_LIMIT: u64 = 16 * 1024 * 1024;
+fn load_image(source: &str, base: &Path) -> Result<image::RgbaImage> {
+    let mut bytes = Vec::new();
+    if source.starts_with("https://") || source.starts_with("http://") {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(8)))
+            .build()
+            .into();
+        let mut response = agent.get(source).call().context("download failed")?;
+        response
+            .body_mut()
+            .with_config()
+            .limit(IMAGE_LIMIT)
+            .reader()
+            .read_to_end(&mut bytes)?;
+    } else {
+        let path = percent_encoding::percent_decode_str(
+            source
+                .split('#')
+                .next()
+                .unwrap_or(source)
+                .split('?')
+                .next()
+                .unwrap_or(source),
+        )
+        .decode_utf8_lossy();
+        let path = base.join(path.as_ref());
+        let file =
+            fs::File::open(&path).with_context(|| format!("cannot open {}", path.display()))?;
+        file.take(IMAGE_LIMIT + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > IMAGE_LIMIT {
+            bail!("image exceeds 16 MiB");
+        }
+    }
+    if let Ok(reader) = image::ImageReader::new(io::Cursor::new(&bytes)).with_guessed_format() {
+        let mut reader = reader;
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(8192);
+        limits.max_image_height = Some(8192);
+        limits.max_alloc = Some(128 * 1024 * 1024);
+        reader.limits(limits);
+        if let Ok(decoded) = reader.decode() {
+            return Ok(decoded.to_rgba8());
+        }
+    }
+    let mut svg_options = resvg::usvg::Options::default();
+    svg_options.fontdb_mut().load_system_fonts();
+    let tree = resvg::usvg::Tree::from_data(&bytes, &svg_options)
+        .context("unsupported image format or invalid image")?;
+    let size = tree.size().to_int_size();
+    let scale = (2048.0 / size.width().max(size.height()) as f32).min(1.0);
+    let width = (size.width() as f32 * scale).round().max(1.0) as u32;
+    let height = (size.height() as f32 * scale).round().max(1.0) as u32;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height).context("invalid SVG size")?;
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(scale, scale),
+        &mut pixmap.as_mut(),
+    );
+    let mut raw = pixmap.take();
+    // tiny-skia uses premultiplied alpha; image uses straight alpha.
+    for p in raw.as_chunks_mut::<4>().0 {
+        if p[3] != 0 {
+            for i in 0..3 {
+                p[i] = ((p[i] as u32 * 255 / p[3] as u32).min(255)) as u8;
+            }
+        }
+    }
+    image::RgbaImage::from_raw(width, height, raw).context("invalid SVG pixels")
+}
+fn image_rows(img: &image::RgbaImage, width: usize, row: &Row) -> Vec<Row> {
+    let by_height = (80u64 * img.width() as u64 / img.height().max(1) as u64).max(1) as usize;
+    let w = (img.width() as usize).min(width).min(by_height).max(1);
+    let h =
+        ((img.height() as f64 * w as f64 / img.width().max(1) as f64).round() as u32).clamp(1, 80);
+    let resized = image::imageops::resize(img, w as u32, h, image::imageops::FilterType::Triangle);
+    let pixel = |x: u32, y: u32| {
+        let p = resized.get_pixel(x, y.min(h - 1));
+        let a = p[3] as u16;
+        let blend = |v: u8, bg: u8| ((v as u16 * a + bg as u16 * (255 - a)) / 255) as u8;
+        Color::Rgb(blend(p[0], 24), blend(p[1], 26), blend(p[2], 32))
+    };
+    (0..h.div_ceil(2))
+        .map(|y| Row {
+            text: String::new(),
+            image: None,
+            pixels: Some(
+                (0..w as u32)
+                    .map(|x| (pixel(x, y * 2), pixel(x, y * 2 + 1)))
+                    .collect(),
+            ),
+            ..row.clone()
+        })
+        .collect()
+}
 fn wrap_rows(rows: &[Row], width: usize) -> Vec<Row> {
     let width = width.max(1);
     let mut result = Vec::new();
     for row in rows {
+        if let Some(img) = &row.image {
+            result.extend(image_rows(img, width, row));
+            continue;
+        }
         let mut text = String::new();
         let mut used = 0;
         for ch in row.text.chars() {
@@ -303,22 +419,32 @@ fn wrap_rows(rows: &[Row], width: usize) -> Vec<Row> {
     }
     result
 }
-fn render(md: &str, cfg: &Config) -> (Vec<Row>, Vec<Heading>) {
+fn render(md: &str, cfg: &Config, base: &Path, images: bool) -> (Vec<Row>, Vec<Heading>) {
     let mut rows = Vec::new();
     let mut headings = Vec::new();
     let mut line = String::new();
     let mut current = None;
     let mut code = false;
     let mut list = 0usize;
+    let mut pending_image: Option<(String, String)> = None;
     let normal = Style::default().fg(color(cfg.text_color.as_deref(), Color::White));
     let title = Style::default()
         .fg(color(cfg.heading_color.as_deref(), Color::Cyan))
         .add_modifier(Modifier::BOLD);
     let flush = |rows: &mut Vec<Row>, line: &mut String, current: Option<usize>| {
+        let row_style = if current.is_some() {
+            title
+        } else if line.starts_with("    ") {
+            Style::default().fg(Color::Yellow)
+        } else {
+            normal
+        };
         rows.push(Row {
             text: std::mem::take(line),
             heading: current,
-            style: if current.is_some() { title } else { normal },
+            style: row_style,
+            image: None,
+            pixels: None,
         });
     };
     let prepared = terminal_markdown(md);
@@ -344,8 +470,31 @@ fn render(md: &str, cfg: &Config) -> (Vec<Row>, Vec<Heading>) {
                 flush(&mut rows, &mut line, current);
                 current = None;
             }
-            Event::Start(Tag::Image { .. }) => line.push_str("[image: "),
-            Event::End(TagEnd::Image) => line.push(']'),
+            Event::Start(Tag::Image { dest_url, .. }) => {
+                if !line.is_empty() {
+                    flush(&mut rows, &mut line, current);
+                }
+                pending_image = Some((dest_url.to_string(), String::new()));
+            }
+            Event::End(TagEnd::Image) => {
+                if let Some((source, alt)) = pending_image.take() {
+                    let text = format!("[image: {}]", if alt.is_empty() { &source } else { &alt });
+                    let mut row = Row {
+                        text,
+                        heading: None,
+                        style: Style::default().fg(Color::DarkGray),
+                        image: None,
+                        pixels: None,
+                    };
+                    if images {
+                        match load_image(&source, base) {
+                            Ok(img) => row.image = Some(Arc::new(img)),
+                            Err(e) => row.text = format!("{} ({}: {e:#})", row.text, source),
+                        }
+                    }
+                    rows.push(row);
+                }
+            }
             Event::Start(Tag::CodeBlock(_)) => {
                 code = true;
             }
@@ -363,6 +512,10 @@ fn render(md: &str, cfg: &Config) -> (Vec<Row>, Vec<Heading>) {
             }
             Event::Start(Tag::BlockQuote(_)) => line.push_str("│ "),
             Event::Text(s) | Event::Code(s) | Event::Html(s) | Event::InlineHtml(s) => {
+                if let Some((_, alt)) = &mut pending_image {
+                    alt.push_str(&s);
+                    continue;
+                }
                 for (i, part) in s.split('\n').enumerate() {
                     if i > 0 {
                         flush(&mut rows, &mut line, current);
@@ -445,6 +598,8 @@ fn tui(rows: Vec<Row>, headings: Vec<Heading>) -> Result<()> {
     if !io::stdout().is_terminal() || !io::stdin().is_terminal() {
         bail!("Interactive mode requires a terminal; use --static for redirected output")
     }
+    // Images need color to be distinguishable; the interactive viewer is graphical.
+    crossterm::style::Colored::set_ansi_color_disabled(false);
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     if let Err(e) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
@@ -493,7 +648,17 @@ fn tui(rows: Vec<Row>, headings: Vec<Heading>) -> Result<()> {
                 } else {
                     shown
                         .iter()
-                        .map(|r| Line::from(Span::styled(r.text.clone(), r.style)))
+                        .map(|r| match &r.pixels {
+                            Some(pixels) => Line::from(
+                                pixels
+                                    .iter()
+                                    .map(|(fg, bg)| {
+                                        Span::styled("▀", Style::default().fg(*fg).bg(*bg))
+                                    })
+                                    .collect::<Vec<_>>(),
+                            ),
+                            None => Line::from(Span::styled(r.text.clone(), r.style)),
+                        })
                         .collect()
                 };
                 let offset = if outline {
@@ -656,7 +821,14 @@ fn run() -> Result<()> {
     } else {
         apply_extensions(original, &cfg)?
     };
-    let (rows, headings) = render(&markdown, &cfg);
+    let interactive =
+        !cli.html && !cli.json && !cli.yaml && !cli.toml && !cli.raw && !cli.static_output;
+    let (rows, headings) = render(
+        &markdown,
+        &cfg,
+        path.parent().unwrap_or(Path::new(".")),
+        interactive,
+    );
     if cli.html {
         print!("{}", html_document(&markdown, cli.raw, &cfg));
     } else if cli.json || cli.yaml || cli.toml {
@@ -694,10 +866,47 @@ fn main() {
 mod tests {
     use super::*;
     #[test]
+    fn images_render_as_colored_cells_and_follow_folding() {
+        let md = "# Top\n![shot](assets/readme-viewer.png)\n# End\n";
+        let (rows, headings) = render(md, &Config::default(), Path::new("."), true);
+        assert!(rows.iter().any(|r| r.image.is_some()));
+        let wrapped = wrap_rows(&rows, 40);
+        assert!(
+            wrapped
+                .iter()
+                .any(|r| r.pixels.as_ref().is_some_and(|p| !p.is_empty()))
+        );
+        assert!(
+            !visible(&rows, &headings, &HashSet::from([0]))
+                .iter()
+                .any(|r| r.image.is_some())
+        );
+        let (missing, _) = render(
+            "![missing](missing.png)",
+            &Config::default(),
+            Path::new("."),
+            true,
+        );
+        assert!(missing.iter().any(|r| r.text.contains("cannot open")));
+    }
+    #[test]
+    fn html_image_and_svg_are_rendered() {
+        let name = format!("readme-test-{}.svg", std::process::id());
+        let path = std::env::temp_dir().join(&name);
+        fs::write(&path, "<svg xmlns='http://www.w3.org/2000/svg' width='4' height='4'><rect width='4' height='4' fill='red'/></svg>").unwrap();
+        let markdown = format!("<div><img alt='red' src='{name}'></div>");
+        let (rows, _) = render(&markdown, &Config::default(), &std::env::temp_dir(), true);
+        fs::remove_file(path).unwrap();
+        let image = rows.iter().find_map(|r| r.image.as_ref()).unwrap();
+        assert_eq!(image.get_pixel(0, 0).0, [255, 0, 0, 255]);
+    }
+    #[test]
     fn html_containers_do_not_hide_markdown_or_leak_tags() {
         let (rows, headings) = render(
             "<div align=\"center\">\n\n# Hello\n\nSome **text**.\n\n</div>\n",
             &Config::default(),
+            Path::new("."),
+            false,
         );
         assert_eq!(headings[0].text, "Hello");
         let text = rows
@@ -707,7 +916,12 @@ mod tests {
             .join("\n");
         assert!(text.contains("Some text."));
         assert!(!text.contains("<div"));
-        let (rows, _) = render("```html\n<div>\n```", &Config::default());
+        let (rows, _) = render(
+            "```html\n<div>\n```",
+            &Config::default(),
+            Path::new("."),
+            false,
+        );
         assert!(rows.iter().any(|r| r.text.contains("<div>")));
     }
     #[test]
@@ -716,6 +930,8 @@ mod tests {
             text: "▾ 中文 heading".into(),
             heading: Some(0),
             style: Style::default(),
+            image: None,
+            pixels: None,
         };
         let wrapped = wrap_rows(&[row], 5);
         assert!(wrapped.len() > 1);
@@ -726,6 +942,8 @@ mod tests {
         let (rows, headings) = render(
             "# First\nA\n## Nested\nB\n# Second\nC\n",
             &Config::default(),
+            Path::new("."),
+            false,
         );
         let shown = visible(&rows, &headings, &HashSet::from([0]));
         let text = shown
