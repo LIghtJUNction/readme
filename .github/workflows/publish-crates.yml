@@ -1,0 +1,165 @@
+name: Publish readme-viewer-tui to crates.io
+
+on:
+  workflow_dispatch:
+    inputs:
+      verify_trusted_publishing:
+        description: Verify OIDC only; set false explicitly to publish an existing release tag
+        type: boolean
+        required: false
+        default: true
+      release_tag:
+        description: Existing vX.Y.Z or X.Y.Z tag; required only when verification is false
+        type: string
+        required: false
+        default: ''
+
+permissions: {}
+
+jobs:
+  verify-trusted-publishing:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.verify_trusted_publishing &&
+      github.repository == 'LIghtJUNction/readme' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: crates-oidc-verify-readme-viewer-tui
+      cancel-in-progress: false
+    permissions:
+      id-token: write
+    steps:
+      - name: Verify crates.io Trusted Publishing
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1
+
+  publish:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.verify_trusted_publishing == false &&
+      github.repository == 'LIghtJUNction/readme' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    concurrency:
+      group: crates-publish-readme-viewer-tui
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        shell: bash
+    env:
+      EXPECTED_CRATE: readme-viewer-tui
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - name: Resolve an existing release tag before checking out source
+        id: release
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo 'An existing semantic-version tag is required; no tag will be created.' >&2
+            exit 1
+          fi
+          git check-ref-format "refs/tags/$RELEASE_TAG"
+          refs=$(git ls-remote --exit-code "https://github.com/$GITHUB_REPOSITORY.git" \
+            "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}")
+          tag_object=$(awk -v ref="refs/tags/$RELEASE_TAG" '$2 == ref {print $1}' <<< "$refs")
+          commit=$(awk -v ref="refs/tags/$RELEASE_TAG^{}" '$2 == ref {print $1}' <<< "$refs")
+          commit=${commit:-$tag_object}
+          [[ "$tag_object" =~ ^[0-9a-f]{40}$ && "$commit" =~ ^[0-9a-f]{40}$ ]]
+          printf 'sha=%s\ntag_object=%s\n' "$commit" "$tag_object" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the immutable tag commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.release.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check tag provenance and package metadata
+        id: package
+        env:
+          RELEASE_SHA: ${{ steps.release.outputs.sha }}
+          TAG_OBJECT: ${{ steps.release.outputs.tag_object }}
+        run: |
+          test "$(git cat-file -t "$RELEASE_SHA")" = commit
+          test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+          test "$(git rev-parse "refs/tags/$RELEASE_TAG")" = "$TAG_OBJECT"
+          test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$RELEASE_SHA"
+          git merge-base --is-ancestor "$RELEASE_SHA" "refs/remotes/origin/$DEFAULT_BRANCH"
+          test -z "$(git status --porcelain)"
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import tomllib
+
+          root = Path.cwd().resolve()
+          package = tomllib.loads(Path("Cargo.toml").read_text())["package"]
+          if package.get("name") != os.environ["EXPECTED_CRATE"]:
+              raise SystemExit("The selected tag contains a different crate")
+          version = package.get("version")
+          if not isinstance(version, str) or os.environ["RELEASE_TAG"] not in (version, "v" + version):
+              raise SystemExit("The existing tag and Cargo.toml version do not match")
+          publish = package.get("publish")
+          if publish is not None and (not isinstance(publish, list) or "crates-io" not in publish):
+              raise SystemExit("Cargo.toml does not permit publishing to crates.io")
+          license_expression = package.get("license")
+          license_file = package.get("license-file")
+          if not isinstance(license_expression, str) or not license_expression.strip():
+              if not isinstance(license_file, str):
+                  raise SystemExit("A license expression or license-file is required")
+              license_path = (root / license_file).resolve()
+              if not license_path.is_relative_to(root) or not license_path.is_file():
+                  raise SystemExit("The declared license-file is missing or outside the repository")
+          if not Path("Cargo.lock").is_file():
+              raise SystemExit("A committed Cargo.lock is required for locked validation")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"version={version}\n")
+          PY
+
+      - name: Install the validation toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+
+      - name: Check formatting
+        run: cargo +stable fmt --package "$EXPECTED_CRATE" -- --check
+
+      - name: Check warnings
+        run: cargo +stable clippy --locked --package "$EXPECTED_CRATE" --all-targets --all-features -- -D warnings
+
+      - name: Test the exact release source
+        run: cargo +stable test --locked --package "$EXPECTED_CRATE" --all-targets --all-features
+
+      - name: Package and verify without publishing
+        run: |
+          cargo +stable package --locked --package "$EXPECTED_CRATE"
+          cargo +stable publish --dry-run --locked --registry crates-io --package "$EXPECTED_CRATE"
+
+      - name: Recheck the tag and clean source before requesting a publishing token
+        env:
+          RELEASE_SHA: ${{ steps.release.outputs.sha }}
+          TAG_OBJECT: ${{ steps.release.outputs.tag_object }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+          test -z "$(git status --porcelain)"
+          refs=$(git ls-remote --exit-code "https://github.com/$GITHUB_REPOSITORY.git" \
+            "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}")
+          tag_object=$(awk -v ref="refs/tags/$RELEASE_TAG" '$2 == ref {print $1}' <<< "$refs")
+          commit=$(awk -v ref="refs/tags/$RELEASE_TAG^{}" '$2 == ref {print $1}' <<< "$refs")
+          commit=${commit:-$tag_object}
+          test "$tag_object" = "$TAG_OBJECT"
+          test "$commit" = "$RELEASE_SHA"
+
+      - name: Authenticate with crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1
+
+      - name: Publish the validated crate
+        timeout-minutes: 10
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        # Verification already completed before authentication; do not rebuild with the token present.
+        run: cargo +stable publish --no-verify --locked --registry crates-io --package "$EXPECTED_CRATE"
